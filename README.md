@@ -75,3 +75,12 @@ CACHES = {
         },
 	}
 ```
+
+If you want to use a different keyspace and column family you can add these
+
+```
+		'KEYSPACE': 'custom_keyspace',
+		'COLUMNFAMILY': 'custom_cf',
+```
+
+the _counter is automatically appended to the COLUMNFAMILY name - so in the example above you'll need custom_cf and custom_cf_counter column families
