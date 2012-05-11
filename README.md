@@ -32,13 +32,16 @@ To use this you need to add a new cache backend - for a local memcached server
 
 On cassandra you need to create the keyspaces and column families.   In cassandra-cli do:
 
+```
 create keyspace cacheandra;
 use keyspace cacheandra;
 create column family cache;
 create column family cache_counter with default_validation_class='CounterColumnType';
+```
 
 As it's a cache a replication factor of 1 is probably fine.
 
+```
 CACHES = {
     'default': {
         'BACKEND': 'cacheandra.cacheandra.CacheBackend',
@@ -46,6 +49,7 @@ CACHES = {
         'CASSANDRA': '127.0.0.1',
         },
 	}
+```
 	
 Of course what's more fun is to use this with a cluster of memcached servers and a cluster of cassandra servers
 
@@ -53,6 +57,7 @@ Here's how the django config would look then with two clusters, 3 memcached serv
 Note the pylibmc options - this is written against this fork of libmemcached 0.53  https://github.com/millarm/Libmemcached which gracefully handles individual server failures.
 Works fine with stock libmemcached and pylibmc
 
+```
 CACHES = {
     'default': {
         'BACKEND': 'cacheandra.cacheandra.CacheBackend',
@@ -69,3 +74,4 @@ CACHES = {
         'OPTIONS' : dict(tcp_nodelay=True, hash='md5', distribution='consistent ketama', remove_failed=3, connect_timeout=1000),
         },
 	}
+```
