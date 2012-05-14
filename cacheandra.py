@@ -67,6 +67,10 @@ class CacheBackend(BaseCache):
             self._servers = server.split(';')
         else:
             self._servers = server
+        if self._servers == ['']:
+            self._memcached_available=False
+        else:
+            self._memcached_available=True
         self._local = local()
         self.timeoutretrydelay = 0.2
         
@@ -75,36 +79,37 @@ class CacheBackend(BaseCache):
         self._cassandra_servers = params.get('CASSANDRA',None)
         self._keyspace = params.get('KEYSPACE','cacheandra')
         self._columnfamilyname = params.get('COLUMNFAMILY','cache')
-
-        try:
-            self._pool = pycassa.ConnectionPool(keyspace=self._keyspace,
-                                               server_list = self._cassandra_servers,
-                                               pool_size = len(self._cassandra_servers),
-                                               timeout=0.5,
-                                               max_retries=2)
-
-        except (InvalidRequestException, UnavailableException, TimedOutException, AuthenticationException,
-                AuthorizationException, SchemaDisagreementException, AllServersUnavailable, NoConnectionAvailable,
-                MaximumRetryException) as e:
-            logger.exception('Cacheandra: failed on connection pool creation %r', e)
-            self._pool = None
-        
         self._cf=None
         self._countercf=None
-        if self._pool is not None:
+
+        if self._cassandra_servers is not None:
             try:
-                self._cf = pycassa.ColumnFamily(self._pool,self._columnfamilyname,
-                                                write_consistency_level=pycassa.ConsistencyLevel.ONE,
-                                                read_consistency_level=pycassa.ConsistencyLevel.QUORUM)
-                self._countercf = pycassa.ColumnFamily(self._pool,self._columnfamilyname+'_counter',
-                                                default_column_validators=pycassa.types.CounterColumnType(),
-                                                write_consistency_level=pycassa.ConsistencyLevel.ONE,
-                                                read_consistency_level=pycassa.ConsistencyLevel.QUORUM)
+                self._pool = pycassa.ConnectionPool(keyspace=self._keyspace,
+                                                   server_list = self._cassandra_servers,
+                                                   pool_size = len(self._cassandra_servers),
+                                                   timeout=0.5,
+                                                   max_retries=2)
+
             except (InvalidRequestException, UnavailableException, TimedOutException, AuthenticationException,
                     AuthorizationException, SchemaDisagreementException, AllServersUnavailable, NoConnectionAvailable,
-                    MaximumRetryException, NotFoundException) as e:
-                self._cf = None
-                self._countercf=None
+                    MaximumRetryException) as e:
+                logger.exception('Cacheandra: failed on connection pool creation %r', e)
+                self._pool = None
+        
+            if self._pool is not None:
+                try:
+                    self._cf = pycassa.ColumnFamily(self._pool,self._columnfamilyname,
+                                                    write_consistency_level=pycassa.ConsistencyLevel.ONE,
+                                                    read_consistency_level=pycassa.ConsistencyLevel.QUORUM)
+                    self._countercf = pycassa.ColumnFamily(self._pool,self._columnfamilyname+'_counter',
+                                                    default_column_validators=pycassa.types.CounterColumnType(),
+                                                    write_consistency_level=pycassa.ConsistencyLevel.ONE,
+                                                    read_consistency_level=pycassa.ConsistencyLevel.QUORUM)
+                except (InvalidRequestException, UnavailableException, TimedOutException, AuthenticationException,
+                        AuthorizationException, SchemaDisagreementException, AllServersUnavailable, NoConnectionAvailable,
+                        MaximumRetryException, NotFoundException) as e:
+                    self._cf = None
+                    self._countercf=None
                 
     @property
     def _cache(self):
@@ -142,47 +147,57 @@ class CacheBackend(BaseCache):
     def add(self, akey, value, timeout=0, version=None):
         key = self.make_key(akey, version=version)
         rv = None
-        try:
-            rv = self._cache.add(key, value, self._get_memcache_timeout(timeout))
-        except _pylibmc.MemcachedError as error:
-            error_num = parseMemcachedError(error)
-            if error_num == MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY:
-                # the server will either come back to life, or die, so we try again
-                logger.info("MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY on add %s" % akey)
-                time.sleep(self.timeoutretrydelay)
-                rv = self.add(akey, value, timeout, version)
-            elif error_num == MEMCACHED_ERROR_SERVER_IS_DEAD:
-                # next attempt should succeed, if not return the failure
+        if self._memcached_available:
+            try:
                 rv = self._cache.add(key, value, self._get_memcache_timeout(timeout))
-            else:
-                rv = False
+            except _pylibmc.MemcachedError as error:
+                error_num = parseMemcachedError(error)
+                if error_num == MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY:
+                    # the server will either come back to life, or die, so we try again
+                    logger.info("MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY on add %s" % akey)
+                    time.sleep(self.timeoutretrydelay)
+                    rv = self.add(akey, value, timeout, version)
+                elif error_num == MEMCACHED_ERROR_SERVER_IS_DEAD:
+                    # next attempt should succeed, if not return the failure
+                    rv = self._cache.add(key, value, self._get_memcache_timeout(timeout))
+                else:
+                    rv = False
         
         if self._cf is not None:
-            try:
-                if isinstance(value, ( int, long )):
-                    self._countercf.add(key=key,column='count',value=value)
-                self._cf.insert(key=key,columns={'val':pickle.dumps(value)},ttl=timeout_to_ttl(timeout))
-            except Exception as e:
-                print lineno(),e
-                logger.exception("Cacheandra insert failed %r",e)
+            if not self._memcached_available:
+                try:
+                    retval = self._cf.get(key=key,columns=['val'])
+                    rv = False
+                except NotFoundException:
+                    rv = True
+            if rv==True:
+                try:
+                    if isinstance(value, ( int, long )):
+                        self._countercf.add(key=key,column='count',value=value)
+                    self._cf.insert(key=key,columns={'val':pickle.dumps(value)},ttl=timeout_to_ttl(timeout))
+                except Exception as e:
+                    print lineno(),e
+                    logger.exception("Cacheandra insert failed %r",e)
         
         return rv
 
     def get(self, akey, default=None, version=None):
+        from polls.cache.dualcache import local_cache
         key = self.make_key(akey, version=version)
         val = None
-        try:
-            val = self._cache.get(key)
-        except _pylibmc.MemcachedError as error:
-            error_num = parseMemcachedError(error)
-            if error_num == MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY:
-                logger.info("MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY on get %s" % akey)
-                time.sleep(self.timeoutretrydelay)
-                val = self.get(akey,default,version)
-            elif error_num == MEMCACHED_ERROR_SERVER_IS_DEAD:
-                logger.error("MEMCACHED_ERROR_SERVER_IS_DEAD on get %s" % key)
-                # server is gone, cache miss
-                val = None
+        if self._memcached_available:
+            try:
+                val = self._cache.get(key)
+            except _pylibmc.MemcachedError as error:
+                error_num = parseMemcachedError(error)
+                if error_num == MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY:
+                    logger.info("MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY on get %s" % akey)
+                    time.sleep(self.timeoutretrydelay)
+                    val = self.get(akey,default,version)
+                elif error_num == MEMCACHED_ERROR_SERVER_IS_DEAD:
+                    logger.error("MEMCACHED_ERROR_SERVER_IS_DEAD on get %s" % key)
+                    # server is gone, cache miss
+                    val = None
 
         if val is None:
             # OK, this could be a cache miss, or we've lost a cache server - so let's try to get it from cass
@@ -208,34 +223,44 @@ class CacheBackend(BaseCache):
                     val = default
                 
                 try:
-                    if val is not None:
+                    if val is not None and self._memcached_available:
                         self._cache.set(key, val, self._get_memcache_timeout(1))
                 except Exception as e:
                     print lineno(),e
                     logger.exception("Cacheandra failed insert after get %r",e)
             else:
                 val=default
-        
+                
         return val
 
     def set(self, akey, value, timeout=0, version=None):
         key = self.make_key(akey, version=version)
-        try:
-            self._cache.set(key, value, self._get_memcache_timeout(timeout))
-        except _pylibmc.MemcachedError as error:
-            error_num = parseMemcachedError(error)
-            if error_num == MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY:
-                logger.info("MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY on set %s %s" % (akey, value))
-                time.sleep(self.timeoutretrydelay)
-                self.set(akey, value, timeout, version)
-            elif error_num == MEMCACHED_ERROR_SERVER_IS_DEAD:
-                # next attempt should succeed, else we'll raise the error
-                logger.error("MEMCACHED_ERROR_SERVER_IS_DEAD on set %s %s" % (akey, value))
+        if self._memcached_available:
+            try:
                 self._cache.set(key, value, self._get_memcache_timeout(timeout))
+            except _pylibmc.MemcachedError as error:
+                error_num = parseMemcachedError(error)
+                if error_num == MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY:
+                    logger.info("MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY on set %s %s" % (akey, value))
+                    time.sleep(self.timeoutretrydelay)
+                    self.set(akey, value, timeout, version)
+                elif error_num == MEMCACHED_ERROR_SERVER_IS_DEAD:
+                    # next attempt should succeed, else we'll raise the error
+                    logger.error("MEMCACHED_ERROR_SERVER_IS_DEAD on set %s %s" % (akey, value))
+                    self._cache.set(key, value, self._get_memcache_timeout(timeout))
         
         if self._cf is not None:
             try:
                 self._cf.insert(key=key,columns={'val':pickle.dumps(value)},ttl=timeout_to_ttl(timeout))
+                if isinstance(value, ( int, long )):
+                    try:
+                        val = self._countercf.get(key=key,columns=['count'])
+                        if 'count' in val:
+                            value-=val['count']
+                    except NotFoundException:
+                        pass
+                    finally:
+                        self._countercf.add(key=key,column='count',value=value)
             except Exception as e:
                 print timeout
                 print lineno(),e
@@ -243,14 +268,15 @@ class CacheBackend(BaseCache):
 
     def delete(self, akey, version=None):
         key = self.make_key(akey, version=version)
-        try:
-            self._cache.delete(key)
-        except _pylibmc.MemcachedError as error:
-            error_num = parseMemcachedError(error)
-            if error_num == MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY:
-                logger.info("MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY on delete %s" % (akey))
-                time.sleep(self.timeoutretrydelay)
-                self.delete(akey, version)
+        if self._memcached_available:
+            try:
+                self._cache.delete(key)
+            except _pylibmc.MemcachedError as error:
+                error_num = parseMemcachedError(error)
+                if error_num == MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY:
+                    logger.info("MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY on delete %s" % (akey))
+                    time.sleep(self.timeoutretrydelay)
+                    self.delete(akey, version)
         
         if self._cf is not None:
             try:
@@ -267,23 +293,25 @@ class CacheBackend(BaseCache):
     def get_many(self, keys, version=None):
         new_keys = map(lambda x: self.make_key(x, version=version), keys)
         ret = None
-        try:
-            ret = self._cache.get_multi(new_keys)
-        except _pylibmc.MemcachedError as error:
-            error_num = parseMemcachedError(error)
-            if error_num == MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY:
-                logger.info("MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY on get_many %s" % (keys))
-                time.sleep(self.timeoutretrydelay)
-                ret = self.get_many(keys,version)
-            elif error_num == MEMCACHED_ERROR_SERVER_IS_DEAD:
-                logger.error("MEMCACHED_ERROR_SERVER_IS_DEAD on get_many %s" % (keys))
-                ret = {}
-        if ret:
-            _ = {}
-            m = dict(zip(new_keys, keys))
-            for k, v in ret.items():
-                _[m[k]] = v
-            ret = _
+        if self._memcached_available:
+            try:
+                ret = self._cache.get_multi(new_keys)
+            except _pylibmc.MemcachedError as error:
+                error_num = parseMemcachedError(error)
+                if error_num == MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY:
+                    logger.info("MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY on get_many %s" % (keys))
+                    time.sleep(self.timeoutretrydelay)
+                    ret = self.get_many(keys,version)
+                elif error_num == MEMCACHED_ERROR_SERVER_IS_DEAD:
+                    logger.error("MEMCACHED_ERROR_SERVER_IS_DEAD on get_many %s" % (keys))
+                    ret = {}
+            if ret:
+                _ = {}
+                m = dict(zip(new_keys, keys))
+                for k, v in ret.items():
+                    _[m[k]] = v
+                ret = _
+
         if ret == None: # this should be impossible
             ret = {}
         
@@ -296,8 +324,8 @@ class CacheBackend(BaseCache):
                 for k, v in value_ret.iteritems():
                     _[m[k]] = pickle.loads(v['val'])
                 blank_new_keys = []
-                for k, v in _.iteritems():
-                    if v is None:
+                for k in new_keys:
+                    if not k in _:
                         blank_new_keys.append(k)
                 if len(blank_new_keys)>0:
                     value_ret = self._countercf.multiget(keys=blank_new_keys)
@@ -312,7 +340,8 @@ class CacheBackend(BaseCache):
                     safe_data[key] = value
                 try:
                     # we've got that missing ttl problem again
-                    self._cache.set_multi(safe_data, self._get_memcache_timeout(1))
+                    if self._memcached_available:
+                        self._cache.set_multi(safe_data, self._get_memcache_timeout(1))
                 except Exception as e:
                     print lineno(),e
                     logger.exception("Cacheandra failed in cache set_multi %r",e)
@@ -328,29 +357,38 @@ class CacheBackend(BaseCache):
     def incr(self, akey, delta=1, version=None):
         key = self.make_key(akey, version=version)
         val = None
-        try:
-            val = self._cache.incr(key, delta)
-        except pylibmc.NotFound:
-            val = None
-        except _pylibmc.MemcachedError as error:
-            error_num = parseMemcachedError(error)
-            if error_num == MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY:
-                logger.info("MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY on incr %s %s" % (akey, delta))
-                time.sleep(self.timeoutretrydelay)
-                self.incr(akey, delta, version)
-            elif error_num == MEMCACHED_ERROR_SERVER_IS_DEAD:
-                logger.error("MEMCACHED_ERROR_SERVER_IS_DEAD on incr %s %s" % (akey, delta))
-                try:
-                    self._cache.incr(key, delta)
-                except pylibmc.NotFound:
-                    val = None
+        if self._memcached_available:
+            try:
+                val = self._cache.incr(key, delta)
+            except pylibmc.NotFound:
+                val = None
+            except _pylibmc.MemcachedError as error:
+                error_num = parseMemcachedError(error)
+                if error_num == MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY:
+                    logger.info("MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY on incr %s %s" % (akey, delta))
+                    time.sleep(self.timeoutretrydelay)
+                    self.incr(akey, delta, version)
+                elif error_num == MEMCACHED_ERROR_SERVER_IS_DEAD:
+                    logger.error("MEMCACHED_ERROR_SERVER_IS_DEAD on incr %s %s" % (akey, delta))
+                    try:
+                        self._cache.incr(key, delta)
+                    except pylibmc.NotFound:
+                        val = None
 
-        if val is None:
-            raise ValueError("Key '%s' not found" % key)
+            if val is None:
+                raise ValueError("Key '%s' not found" % key)            
         
         if self._countercf is not None:
+            if not self._memcached_available:
+                # we can't rely on memcached having told us if the value isn't there
+                try:
+                    retval = self._countercf.get(key,columns=['count'])
+                except NotFoundException:
+                    raise ValueError("Key '%s' not found" % key)            
             try:
                 self._countercf.add(key,'count',delta)
+                # we are changing the value, so remove the duplicate (now old) value from the non counter CF
+                self._cf.remove(key=key,columns=['val'])
                 try:
                     retval = self._countercf.get(key,columns=['count'])
                     if 'count' in retval:
@@ -361,32 +399,40 @@ class CacheBackend(BaseCache):
             except Exception as e:
                 print lineno(),e
                 logger.exception("Cacheandra exception on add %r",e)
-        
         return val
 
     def decr(self, akey, delta=1, version=None):
         key = self.make_key(akey, version=version)
         val = None
-        try:
-            val = self._cache.decr(key, delta)
-        except pylibmc.NotFound:
-            val = None
-        except _pylibmc.MemcachedError as error:
-            error_num = parseMemcachedError(error)
-            if error_num == MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY:
-                logger.info("MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY on decr %s %s" % (akey, delta))
-                time.sleep(self.timeoutretrydelay)
-                self.decr(akey, delta, version)
-            elif error_num == MEMCACHED_ERROR_SERVER_IS_DEAD:
-                logger.error("MEMCACHED_ERROR_SERVER_IS_DEAD on decr %s %s" % (akey, delta))
-                try:
-                    self._cache.decr(key, delta)
-                except pylibmc.NotFound:
-                    val = None
+        if self._memcached_available:
+            try:
+                val = self._cache.decr(key, delta)
+            except pylibmc.NotFound:
+                val = None
+            except _pylibmc.MemcachedError as error:
+                error_num = parseMemcachedError(error)
+                if error_num == MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY:
+                    logger.info("MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY on decr %s %s" % (akey, delta))
+                    time.sleep(self.timeoutretrydelay)
+                    self.decr(akey, delta, version)
+                elif error_num == MEMCACHED_ERROR_SERVER_IS_DEAD:
+                    logger.error("MEMCACHED_ERROR_SERVER_IS_DEAD on decr %s %s" % (akey, delta))
+                    try:
+                        self._cache.decr(key, delta)
+                    except pylibmc.NotFound:
+                        val = None
 
         if self._countercf is not None:
+            if not self._memcached_available:
+                # we can't rely on memcached having told us if the value isn't there
+                try:
+                    retval = self._countercf.get(key,columns=['count'])
+                except NotFoundException:
+                    raise ValueError("Key '%s' not found" % key)            
             try:
                 self._countercf.add(key,'count',-delta)
+                # we are changing the value, so remove the duplicate (now old) value from the non counter CF
+                self._cf.remove(key=key,columns=['val'])
                 try:
                     retval = self._countercf.get(key,columns=['count'])
                     if 'count' in retval:
@@ -407,17 +453,18 @@ class CacheBackend(BaseCache):
         for key, value in data.items():
             key = self.make_key(key, version=version)
             safe_data[key] = value
-        try:
-            self._cache.set_multi(safe_data, self._get_memcache_timeout(timeout))
-        except _pylibmc.MemcachedError as error:
-            error_num = parseMemcachedError(error)
-            if error_num == MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY:
-                logger.info("MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY on set_many %s" % (data))
-                time.sleep(self.timeoutretrydelay)
-                self.set_many(data,timeout,version)
-            elif error_num == MEMCACHED_ERROR_SERVER_IS_DEAD:
-                logger.error("MEMCACHED_ERROR_SERVER_IS_DEAD on set_many %s" % (data))
+        if self._memcached_available:
+            try:
                 self._cache.set_multi(safe_data, self._get_memcache_timeout(timeout))
+            except _pylibmc.MemcachedError as error:
+                error_num = parseMemcachedError(error)
+                if error_num == MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY:
+                    logger.info("MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY on set_many %s" % (data))
+                    time.sleep(self.timeoutretrydelay)
+                    self.set_many(data,timeout,version)
+                elif error_num == MEMCACHED_ERROR_SERVER_IS_DEAD:
+                    logger.error("MEMCACHED_ERROR_SERVER_IS_DEAD on set_many %s" % (data))
+                    self._cache.set_multi(safe_data, self._get_memcache_timeout(timeout))
         
         if self._cf is not None:
             try:
@@ -432,15 +479,16 @@ class CacheBackend(BaseCache):
 
     def delete_many(self, keys, version=None):
         l = lambda x: self.make_key(x, version=version)
-        try:
-            self._cache.delete_multi(map(l, keys))
-        except _pylibmc.MemcachedError as error:
-            error_num = parseMemcachedError(error)
-            if error_num == MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY:
-                logger.info("MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY on delete_many %s" % (keys))
-                time.sleep(self.timeoutretrydelay)
-                self.delete_many(keys, version)
-            # special case, if the server has been marked dead, we don't need to worry about deleting!
+        if self._memcached_available:
+            try:
+                self._cache.delete_multi(map(l, keys))
+            except _pylibmc.MemcachedError as error:
+                error_num = parseMemcachedError(error)
+                if error_num == MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY:
+                    logger.info("MEMCACHED_ERROR_SERVER_DISABLED_UNTIL_TIMED_RETRY on delete_many %s" % (keys))
+                    time.sleep(self.timeoutretrydelay)
+                    self.delete_many(keys, version)
+                # special case, if the server has been marked dead, we don't need to worry about deleting!
 
         if self._cf is not None:
             try:

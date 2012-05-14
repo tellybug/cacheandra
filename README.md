@@ -84,3 +84,7 @@ If you want to use a different keyspace and column family you can add these
 ```
 
 the _counter is automatically appended to the COLUMNFAMILY name - so in the example above you'll need custom_cf and custom_cf_counter column families
+
+It is valid to configure the cache backend with no memcached servers (go direct to cassandra) and no cassandra servers (same as a traditional memcached backend)
+
+So a configuration with a permanent cassandra cluster backend can go from 0..n memcached servers depending on load
